@@ -1,0 +1,8 @@
+{
+  "uuid": "mood@local",
+  "name": "mood",
+  "description": "Controle wallpapers Unsplash e o esquema de cores pelo Quick Settings.",
+  "shell-version": ["45", "46", "47", "48", "49", "50"],
+  "version": 1
+}
+
