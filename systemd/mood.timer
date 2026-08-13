@@ -1,0 +1,15 @@
+[Unit]
+Description=Hourly mood wallpaper update
+After=graphical-session.target
+Wants=graphical-session.target
+
+[Timer]
+OnStartupSec=10s
+OnUnitActiveSec=1h
+AccuracySec=1s
+RandomizedDelaySec=0
+Unit=mood.service
+
+[Install]
+WantedBy=timers.target
+
