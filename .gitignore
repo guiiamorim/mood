@@ -1,0 +1,10 @@
+# Local mood credentials, state, cache and downloaded wallpapers
+.env
+*.local
+.mood-state/
+
+# User/runtime files created by installation or tests
+__pycache__/
+*.log
+*.tmp
+*.zip
