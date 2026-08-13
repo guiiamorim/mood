@@ -1,0 +1,475 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+APP_NAME="mood"
+API_BASE="https://api.unsplash.com"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/mood"
+CONFIG_FILE="$CONFIG_DIR/config"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/mood"
+IMAGE_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/mood"
+LOCK_DIR="$STATE_DIR/.lock"
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd)"
+BUNDLE_ROOT="${MOOD_BUNDLE_ROOT:-$(cd -- "$SCRIPT_DIR/.." && pwd)}"
+TARGET_BIN="$HOME/.local/bin/mood"
+EXTENSION_UUID="mood@local"
+EXTENSION_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/gnome-shell/extensions/$EXTENSION_UUID"
+MAX_ATTEMPTS=8
+LUMINANCE_THRESHOLD="${MOOD_LUMINANCE_THRESHOLD:-0.50}"
+
+TOPICS=(
+  "dreamlike surreal landscapes"
+  "minimalist architecture"
+  "cinematic neon city"
+  "outer space nebulae"
+  "moody forest atmosphere"
+  "abstract color geometry"
+  "macro nature textures"
+  "quiet coastal horizons"
+)
+
+log() { printf '[mood] %s\n' "$*" >&2; }
+die() { log "erro: $*"; exit 1; }
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "comando necessário não encontrado: $1"
+}
+
+ensure_runtime_dependencies() {
+  local cmd
+  for cmd in bash curl jq gsettings awk mktemp install mv find; do
+    require_command "$cmd"
+  done
+  if command -v magick >/dev/null 2>&1; then
+    MAGICK_BIN="magick"
+  elif command -v convert >/dev/null 2>&1; then
+    MAGICK_BIN="convert"
+  else
+    die "ImageMagick não encontrado (instale o pacote imagemagick)"
+  fi
+}
+
+load_config() {
+  [[ -f "$CONFIG_FILE" ]] || die "Access Key ausente; execute '$TARGET_BIN install'"
+  # shellcheck disable=SC1090
+  set -a
+  . "$CONFIG_FILE"
+  set +a
+  [[ "${UNSPLASH_ACCESS_KEY:-}" =~ ^[A-Za-z0-9_-]{20,}$ ]] || die "UNSPLASH_ACCESS_KEY inválida em $CONFIG_FILE"
+}
+
+mkdir_state() {
+  mkdir -p "$CONFIG_DIR" "$STATE_DIR" "$IMAGE_DIR"
+  chmod 700 "$CONFIG_DIR" "$STATE_DIR" "$IMAGE_DIR"
+}
+
+state_get() {
+  local name="$1" default="${2:-}" file="$STATE_DIR/$1" value=""
+  if [[ -f "$file" ]]; then
+    IFS= read -r value < "$file" || true
+    printf '%s' "$value"
+  else
+    printf '%s' "$default"
+  fi
+}
+
+state_set() {
+  local name="$1" value="$2" tmp
+  tmp="$(mktemp "$STATE_DIR/.${name}.XXXXXX")"
+  printf '%s\n' "$value" > "$tmp"
+  chmod 600 "$tmp"
+  mv -f -- "$tmp" "$STATE_DIR/$name"
+}
+
+acquire_lock() {
+  mkdir -p "$STATE_DIR"
+  if mkdir "$LOCK_DIR" 2>/dev/null; then
+    printf '%s\n' "$$" > "$LOCK_DIR/pid"
+    trap 'rm -rf -- "$LOCK_DIR"' EXIT
+    return 0
+  fi
+  local old_pid=""
+  [[ -f "$LOCK_DIR/pid" ]] && IFS= read -r old_pid < "$LOCK_DIR/pid" || true
+  if [[ "$old_pid" =~ ^[0-9]+$ ]] && ! kill -0 "$old_pid" 2>/dev/null; then
+    rm -rf -- "$LOCK_DIR"
+    acquire_lock
+    return
+  fi
+  log "já existe uma operação do mood em andamento"
+  exit 75
+}
+
+boot_id() {
+  if [[ -r /proc/sys/kernel/random/boot_id ]]; then
+    tr -d '[:space:]' < /proc/sys/kernel/random/boot_id
+  else
+    printf 'unknown-boot'
+  fi
+}
+
+random_topic() {
+  printf '%s\n' "${TOPICS[RANDOM % ${#TOPICS[@]}]}"
+}
+
+choose_topic() {
+  local requested="${1:-random}"
+  if [[ "$requested" == "random" || -z "$requested" ]]; then
+    random_topic
+  else
+    printf '%s' "$requested"
+  fi
+}
+
+initialize_session() {
+  local current_boot previous_boot topic mode
+  current_boot="$(boot_id)"
+  previous_boot="$(state_get boot_id)"
+  if [[ "$current_boot" != "$previous_boot" ]]; then
+    topic="$(random_topic)"
+    state_set boot_id "$current_boot"
+    state_set topic "$topic"
+    state_set scheme_mode auto
+    state_set target_class ""
+    state_set operation "initializing"
+    state_set last_error ""
+  else
+    [[ -s "$STATE_DIR/topic" ]] || state_set topic "$(random_topic)"
+    mode="$(state_get scheme_mode auto)"
+    case "$mode" in auto|light|dark) ;; *) state_set scheme_mode auto; state_set target_class "" ;; esac
+  fi
+}
+
+apply_scheme() {
+  local class="$1"
+  case "$class" in
+    light) gsettings set org.gnome.desktop.interface color-scheme default >/dev/null ;;
+    dark) gsettings set org.gnome.desktop.interface color-scheme prefer-dark >/dev/null ;;
+    *) return 1 ;;
+  esac
+}
+
+apply_wallpaper() {
+  local file="$1" uri
+  uri="file://$file"
+  gsettings set org.gnome.desktop.background picture-uri "$uri" >/dev/null
+  gsettings set org.gnome.desktop.background picture-uri-dark "$uri" >/dev/null
+}
+
+photo_is_recent() {
+  local id="$1"
+  [[ -f "$STATE_DIR/recent_ids" ]] && grep -Fqx -- "$id" "$STATE_DIR/recent_ids"
+}
+
+remember_photo() {
+  local id="$1" tmp
+  {
+    printf '%s\n' "$id"
+    [[ -f "$STATE_DIR/recent_ids" ]] && cat "$STATE_DIR/recent_ids"
+  } | awk 'NF && !seen[$0]++ { if (count++ < 30) print }' > "${STATE_DIR}/recent_ids.tmp"
+  mv -f -- "$STATE_DIR/recent_ids.tmp" "$STATE_DIR/recent_ids"
+}
+
+fetch_photo_json() {
+  local topic="$1"
+  curl -fsSL --retry 2 --connect-timeout 10 --max-time 30 \
+    -H "Authorization: Client-ID $UNSPLASH_ACCESS_KEY" \
+    -H 'Accept-Version: v1' \
+    --get "$API_BASE/photos/random" \
+    --data-urlencode "query=$topic" \
+    --data-urlencode 'orientation=landscape' \
+    --data-urlencode 'content_filter=high'
+}
+
+download_candidate() {
+  local json="$1" id url tmp final
+  id="$(jq -er '.id // empty' <<<"$json")" || return 1
+  url="$(jq -er '.urls.regular // .urls.full // empty' <<<"$json")" || return 1
+  photo_is_recent "$id" && return 2
+  tmp="$(mktemp "$IMAGE_DIR/.candidate.XXXXXX.jpg")"
+  if ! curl -fL --retry 2 --connect-timeout 10 --max-time 90 -o "$tmp" "$url"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  [[ -s "$tmp" ]] || { rm -f -- "$tmp"; return 1; }
+  final="$IMAGE_DIR/$id.jpg"
+  mv -f -- "$tmp" "$final"
+  printf '%s\n' "$final"
+}
+
+measure_class() {
+  local image="$1" luminance
+  luminance="$($MAGICK_BIN "$image" -auto-orient -resize '64x64^' -gravity center -extent 64x64 -colorspace Gray -format '%[fx:mean]' info:)" || return 1
+  awk -v value="$luminance" -v threshold="$LUMINANCE_THRESHOLD" 'BEGIN { print (value >= threshold ? "light" : "dark") }'
+}
+
+track_download() {
+  local json="$1" endpoint
+  endpoint="$(jq -er '.links.download_location // empty' <<<"$json")" || return 0
+  curl -fsSL --retry 1 --connect-timeout 5 --max-time 20 \
+    -H "Authorization: Client-ID $UNSPLASH_ACCESS_KEY" \
+    -H 'Accept-Version: v1' "$endpoint" >/dev/null || log "aviso: não foi possível registrar o download"
+}
+
+apply_candidate() {
+  local json="$1" image="$2" id class photographer photo_url
+  id="$(jq -er '.id' <<<"$json")"
+  class="$(measure_class "$image")"
+  photographer="$(jq -r '.user.name // "Desconhecido"' <<<"$json" | tr '\n' ' ' | cut -c1-200)"
+  photo_url="$(jq -r '.links.html // empty' <<<"$json")"
+  apply_wallpaper "$image"
+  apply_scheme "$class"
+  track_download "$json"
+  state_set target_class "$class"
+  state_set last_photo_id "$id"
+  state_set last_image "$image"
+  state_set photographer "$photographer"
+  state_set photo_url "$photo_url"
+  state_set operation "applied"
+  state_set last_error ""
+  remember_photo "$id"
+  log "wallpaper aplicado: $id ($class, $photographer)"
+}
+
+fetch_and_apply() {
+  local topic="$1" required_class="${2:-}" attempt json image class id
+  state_set operation "searching"
+  state_set last_error ""
+  for ((attempt=1; attempt<=MAX_ATTEMPTS; attempt++)); do
+    if ! json="$(fetch_photo_json "$topic")"; then
+      state_set operation "failed"
+      state_set last_error "falha de rede ou API"
+      return 1
+    fi
+    id="$(jq -r '.id // empty' <<<"$json")"
+    [[ -n "$id" ]] || continue
+    image=""
+    if ! image="$(download_candidate "$json")"; then
+      continue
+    fi
+    if ! class="$(measure_class "$image")"; then
+      rm -f -- "$image"
+      continue
+    fi
+    if [[ -n "$required_class" && "$class" != "$required_class" ]]; then
+      rm -f -- "$image"
+      continue
+    fi
+    apply_candidate "$json" "$image"
+    return 0
+  done
+  state_set operation "failed"
+  state_set last_error "nenhuma imagem compatível após $MAX_ATTEMPTS tentativas"
+  log "nenhuma imagem compatível encontrada"
+  return 1
+}
+
+run_mood() {
+  ensure_runtime_dependencies
+  load_config
+  mkdir_state
+  acquire_lock
+  initialize_session
+  local topic mode target
+  topic="$(state_get topic)"
+  mode="$(state_get scheme_mode auto)"
+  target="$(state_get target_class)"
+  if [[ -z "$target" ]]; then
+    case "$mode" in light) target=light ;; dark) target=dark ;; auto) target="" ;; esac
+  fi
+  fetch_and_apply "$topic" "$target" || true
+}
+
+next_mood() {
+  ensure_runtime_dependencies
+  load_config
+  mkdir_state
+  acquire_lock
+  initialize_session
+  local topic mode target
+  topic="$(state_get topic)"
+  mode="$(state_get scheme_mode auto)"
+  target="$(state_get target_class)"
+  case "$mode" in light) target=light ;; dark) target=dark ;; auto) ;; esac
+  fetch_and_apply "$topic" "$target" || true
+}
+
+set_topic() {
+  local topic="${1:-}"
+  [[ -n "$topic" ]] || die "uso: mood set-topic <tópico|random>"
+  ensure_runtime_dependencies
+  load_config
+  mkdir_state
+  acquire_lock
+  initialize_session
+  topic="$(choose_topic "$topic")"
+  state_set topic "$topic"
+  next_mood_unlocked
+}
+
+next_mood_unlocked() {
+  local topic mode target
+  topic="$(state_get topic)"
+  mode="$(state_get scheme_mode auto)"
+  target="$(state_get target_class)"
+  case "$mode" in light) target=light ;; dark) target=dark ;; auto) ;; esac
+  fetch_and_apply "$topic" "$target" || true
+}
+
+set_scheme() {
+  local scheme="${1:-}"
+  [[ "$scheme" == auto || "$scheme" == light || "$scheme" == dark ]] || die "uso: mood set-scheme <auto|light|dark>"
+  ensure_runtime_dependencies
+  load_config
+  mkdir_state
+  acquire_lock
+  initialize_session
+  state_set scheme_mode "$scheme"
+  if [[ "$scheme" == auto ]]; then
+    state_set target_class ""
+    next_mood_unlocked
+  else
+    state_set target_class "$scheme"
+    apply_scheme "$scheme"
+    next_mood_unlocked
+  fi
+}
+
+print_status() {
+  printf 'app=%s\n' "$APP_NAME"
+  printf 'topic=%s\n' "$(state_get topic unknown)"
+  printf 'scheme=%s\n' "$(state_get scheme_mode auto)"
+  printf 'classification=%s\n' "$(state_get target_class pending)"
+  printf 'operation=%s\n' "$(state_get operation idle)"
+  printf 'image=%s\n' "$(state_get last_image)"
+  printf 'photographer=%s\n' "$(state_get photographer)"
+  printf 'photo_url=%s\n' "$(state_get photo_url)"
+  printf 'error=%s\n' "$(state_get last_error)"
+}
+
+print_topics() {
+  printf '%s\n' "${TOPICS[@]}"
+}
+
+install_mood() {
+  local source_root="${MOOD_BUNDLE_ROOT:-$BUNDLE_ROOT}" target extension_source pack_dir extension_bundle enabled_extensions
+  local cmd
+  for cmd in bash curl jq gsettings systemctl gjs gnome-extensions install; do
+    require_command "$cmd"
+  done
+  if ! command -v magick >/dev/null 2>&1 && ! command -v convert >/dev/null 2>&1; then
+    die "ImageMagick não encontrado (instale o pacote imagemagick)"
+  fi
+  mkdir -p "$CONFIG_DIR" "$STATE_DIR" "$IMAGE_DIR" "$(dirname -- "$TARGET_BIN")"
+  chmod 700 "$CONFIG_DIR" "$STATE_DIR" "$IMAGE_DIR"
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    if [[ ! -t 0 ]]; then
+      die "execute o instalador em um terminal para informar a Access Key"
+    fi
+    local key
+    read -r -s -p 'Unsplash Access Key: ' key
+    printf '\n'
+    [[ "$key" =~ ^[A-Za-z0-9_-]{20,}$ ]] || die "Access Key inválida"
+    printf 'UNSPLASH_ACCESS_KEY=%q\n' "$key" > "$CONFIG_FILE"
+    chmod 600 "$CONFIG_FILE"
+    unset key
+  fi
+  target="$TARGET_BIN"
+  install -Dm755 "$SCRIPT_PATH" "$target"
+  extension_source="$source_root/gnome-extension/$EXTENSION_UUID"
+  [[ -d "$extension_source" ]] || die "arquivos da extensão não encontrados em $extension_source"
+  # Install the standard per-user directory first. GNOME documents this as a
+  # supported installation path; some Ubuntu builds have a broken async
+  # gnome-extensions install path and fail before completing extraction.
+  rm -rf -- "$EXTENSION_DIR"
+  mkdir -p "$(dirname -- "$EXTENSION_DIR")"
+  cp -a -- "$extension_source" "$EXTENSION_DIR"
+
+  # Also try the official bundle installer when available. If it fails, keep
+  # the validated directory above and continue with the GSettings fallback.
+  pack_dir="$(mktemp -d "${TMPDIR:-/tmp}/mood-extension.XXXXXX")"
+  gnome-extensions pack "$extension_source" --out-dir "$pack_dir" >/dev/null 2>&1 || true
+  extension_bundle="$pack_dir/$EXTENSION_UUID.shell-extension.zip"
+  if [[ -f "$extension_bundle" ]] && ! gnome-extensions install --force "$extension_bundle" >/dev/null 2>&1; then
+    log "gnome-extensions install falhou; usando instalação manual suportada"
+  fi
+  rm -rf -- "$pack_dir"
+  # gnome-extensions enable talks to the running Shell. If the Shell has not
+  # refreshed its extension registry yet, update the enabled UUID list so the
+  # next session loads mood automatically.
+  if ! gnome-extensions enable "$EXTENSION_UUID" >/dev/null 2>&1; then
+    enabled_extensions="$(gsettings get org.gnome.shell enabled-extensions 2>/dev/null || printf '[]')"
+    if [[ "$enabled_extensions" != *"'$EXTENSION_UUID'"* ]]; then
+      if [[ "$enabled_extensions" == "[]" ]]; then
+        enabled_extensions="['$EXTENSION_UUID']"
+      else
+        enabled_extensions="${enabled_extensions%]}, '$EXTENSION_UUID']"
+      fi
+      gsettings set org.gnome.shell enabled-extensions "$enabled_extensions" >/dev/null 2>&1 || \
+        log "não foi possível marcar a extensão como ativa; reexecute 'gnome-extensions enable $EXTENSION_UUID' após entrar na sessão"
+    fi
+  fi
+  [[ -f "$source_root/systemd/mood.service" && -f "$source_root/systemd/mood.timer" ]] || die "unidades systemd não encontradas em $source_root/systemd"
+  mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+  install -Dm644 "$source_root/systemd/mood.service" "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/mood.service"
+  install -Dm644 "$source_root/systemd/mood.timer" "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/mood.timer"
+  systemctl --user daemon-reload
+  if command -v dbus-update-activation-environment >/dev/null 2>&1; then
+    dbus-update-activation-environment --systemd DISPLAY WAYLAND_DISPLAY XDG_CURRENT_DESKTOP DBUS_SESSION_BUS_ADDRESS >/dev/null 2>&1 || true
+  fi
+  systemctl --user enable --now mood.timer
+  systemctl --user restart mood.timer
+  # Do not wait for the first timer tick after installation.
+  systemctl --user start mood.service >/dev/null 2>&1 || \
+    log "não foi possível executar a primeira troca agora; o timer tentará novamente"
+  log "mood instalado em $target"
+}
+
+uninstall_mood() {
+  require_command systemctl
+  systemctl --user disable --now mood.timer >/dev/null 2>&1 || true
+  if command -v gnome-extensions >/dev/null 2>&1; then
+    gnome-extensions disable "$EXTENSION_UUID" >/dev/null 2>&1 || true
+  fi
+  rm -f -- "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/mood.service" "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/mood.timer"
+  systemctl --user daemon-reload >/dev/null 2>&1 || true
+  rm -f -- "$TARGET_BIN"
+  rm -rf -- "$EXTENSION_DIR"
+  log "mood removido; configuração, estado e wallpapers foram preservados"
+}
+
+usage() {
+  cat <<'EOF'
+Uso: mood <comando>
+
+Comandos:
+  run                       Executa a atualização automática
+  next                      Busca e aplica outro wallpaper
+  set-topic <tópico|random> Define o tópico e troca imediatamente
+  set-scheme <auto|light|dark>
+                            Define o esquema e troca imediatamente
+  status                    Mostra o estado atual
+  topics                    Lista os tópicos padrão
+  install                   Instala o mood, timer e extensão GNOME
+  uninstall                 Remove arquivos instalados, preservando dados
+EOF
+}
+
+main() {
+  local command="${1:-}"
+  shift || true
+  case "$command" in
+    run) run_mood "$@" ;;
+    next) next_mood "$@" ;;
+    set-topic) set_topic "$@" ;;
+    set-scheme) set_scheme "$@" ;;
+    status) print_status "$@" ;;
+    topics) print_topics "$@" ;;
+    install) install_mood "$@" ;;
+    uninstall) uninstall_mood "$@" ;;
+    -h|--help|help|'') usage ;;
+    *) die "comando desconhecido: $command" ;;
+  esac
+}
+
+main "$@"
+
