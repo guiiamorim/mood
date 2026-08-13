@@ -1,0 +1,10 @@
+[Unit]
+Description=mood Unsplash wallpaper
+After=graphical-session.target
+Wants=graphical-session.target
+
+[Service]
+Type=oneshot
+PassEnvironment=DISPLAY WAYLAND_DISPLAY XDG_CURRENT_DESKTOP DBUS_SESSION_BUS_ADDRESS
+ExecStart=%h/.local/bin/mood run
+
